@@ -36,6 +36,7 @@ slog = { version = "2.5", features = ["max_level_debug"] }
 slog-term = "2.6"
 memchr = "2.3"
 anyhow = "1.0"
+linelog = { git = "https://github.com/facebook/sapling.git", package = "sapling-linelog" }
 
 [dev-dependencies]
 iobuffer = "0.2.0"
