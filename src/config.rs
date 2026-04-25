@@ -22,6 +22,9 @@ pub const FIXUP_TARGET_ALWAYS_SHA_DEFAULT: bool = false;
 pub const CREATE_SQUASH_COMMITS_CONFIG_NAME: &str = "absorb.createSquashCommits";
 pub const CREATE_SQUASH_COMMITS_DEFAULT: bool = false;
 
+pub const USE_LINELOG_CONFIG_NAME: &str = "absorb.useLineLog";
+pub const USE_LINELOG_DEFAULT: bool = false;
+
 pub fn unify<'config>(config: &'config Config, repo: &Repository) -> Config<'config> {
     Config {
         // here, we default to the git config value,
@@ -49,6 +52,7 @@ pub fn unify<'config>(config: &'config Config, repo: &Repository) -> Config<'con
             || bool_value(repo, FORCE_AUTHOR_CONFIG_NAME, FORCE_AUTHOR_DEFAULT),
         force_detach: config.force_detach
             || bool_value(repo, FORCE_DETACH_CONFIG_NAME, FORCE_DETACH_DEFAULT),
+        linelog: config.linelog || bool_value(repo, USE_LINELOG_CONFIG_NAME, USE_LINELOG_DEFAULT),
         ..*config
     }
 }

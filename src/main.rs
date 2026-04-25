@@ -46,6 +46,12 @@ struct Cli {
     /// Match the change against the complete file
     #[clap(long, short)]
     whole_file: bool,
+    /// Use experimental linelog-backed hunk attribution
+    #[clap(long)]
+    linelog: bool,
+    /// Rewrite the stack directly instead of creating fixup commits
+    #[clap(long)]
+    rewrite: bool,
     /// Only generate one fixup per commit
     #[clap(long, short = 'F')]
     one_fixup_per_commit: bool,
@@ -70,6 +76,8 @@ fn main() {
         rebase_options,
         gen_completions,
         whole_file,
+        linelog,
+        rewrite,
         one_fixup_per_commit,
         squash,
         message,
@@ -126,6 +134,8 @@ fn main() {
             rebase_options: &rebase_options,
             no_limit,
             whole_file,
+            linelog,
+            rewrite,
             one_fixup_per_commit,
             squash,
             message: message.as_deref(),

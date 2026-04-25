@@ -4,7 +4,9 @@ use anyhow::{anyhow, Result};
 
 mod commute;
 mod config;
+mod linelog_mode;
 mod owned;
+mod rewrite;
 mod stack;
 
 use git2::DiffStats;
@@ -20,6 +22,8 @@ pub struct Config<'a> {
     pub and_rebase: bool,
     pub rebase_options: &'a Vec<&'a str>,
     pub whole_file: bool,
+    pub linelog: bool,
+    pub rewrite: bool,
     pub one_fixup_per_commit: bool,
     pub squash: bool,
     pub message: Option<&'a str>,
@@ -34,12 +38,7 @@ pub fn run(logger: &slog::Logger, config: &Config) -> Result<()> {
 
 fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository) -> Result<()> {
     let config = config::unify(config, repo);
-
-    if !config.rebase_options.is_empty() && !config.and_rebase {
-        return Err(anyhow!(
-            "REBASE_OPTIONS were specified without --and-rebase flag"
-        ));
-    }
+    validate_config(&config)?;
 
     let mut we_added_everything_to_index = false;
     if nothing_left_in_index(repo)? {
@@ -117,165 +116,45 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
            "index" => format!("{:?}", index),
     );
 
+    if config.rewrite {
+        let head_commit = repo.head()?.peel_to_commit()?;
+        let outcome = rewrite::run(
+            repo,
+            &stack,
+            &index,
+            &config,
+            we_added_everything_to_index,
+            logger,
+        )?;
+        announce_unabsorbed(
+            logger,
+            repo,
+            &config,
+            &stack,
+            stack_end_reason,
+            &head_commit,
+            index.len(),
+            outcome.modified_hunks_without_target,
+            outcome.non_modified_patches,
+            we_added_everything_to_index,
+        );
+        return Ok(());
+    }
+
     let signature = repo
         .signature()
         .or_else(|_| git2::Signature::now("nobody", "nobody@example.com"))?;
     let mut head_commit = repo.head()?.peel_to_commit()?;
 
-    let mut hunks_with_commit = vec![];
-
-    let mut modified_hunks_without_target = 0usize;
-    let mut non_modified_patches = 0usize;
-    'patch: for index_patch in index.iter() {
-        let old_path = index_patch.new_path.as_slice();
-        if index_patch.status != git2::Delta::Modified {
-            debug!(logger, "skipped non-modified patch";
-                    "path" => String::from_utf8_lossy(old_path).into_owned(),
-                    "status" => format!("{:?}", index_patch.status),
-            );
-            non_modified_patches += 1;
-            continue 'patch;
-        }
-
-        let mut preceding_hunks_offset = 0isize;
-        let mut applied_hunks_offset = 0isize;
-        'hunk: for index_hunk in &index_patch.hunks {
-            debug!(logger, "next hunk";
-                   "header" => index_hunk.header(),
-                   "path" => String::from_utf8_lossy(old_path).into_owned(),
-            );
-
-            // To properly handle files ("patches" in libgit2 lingo) with multiple hunks, we
-            // need to find the updated line coordinates (`header`) of the current hunk in
-            // two cases:
-            // 1) As if it were the only hunk in the index. This only involves shifting the
-            // "added" side *up* by the offset introduced by the preceding hunks:
-            let isolated_hunk = index_hunk
-                .clone()
-                .shift_added_block(-preceding_hunks_offset);
-
-            // 2) When applied on top of the previously committed hunks. This requires shifting
-            // both the "added" and the "removed" sides of the previously isolated hunk *down*
-            // by the offset of the committed hunks:
-            let hunk_to_apply = isolated_hunk
-                .clone()
-                .shift_both_blocks(applied_hunks_offset);
-
-            // The offset is the number of lines added minus the number of lines removed by a hunk:
-            let hunk_offset = index_hunk.changed_offset();
-
-            // To aid in understanding these arithmetic, here's an illustration.
-            // There are two hunks in the original patch, each adding one line ("line2" and
-            // "line5"). Assuming the first hunk (with offset = -1) was already processed
-            // and applied, the table shows the three versions of the patch, with line numbers
-            // on the <A>dded and <R>emoved sides for each:
-            // |----------------|-----------|------------------|
-            // |                |           | applied on top   |
-            // | original patch | isolated  | of the preceding |
-            // |----------------|-----------|------------------|
-            // | <R> <A>        | <R> <A>   | <R> <A>          |
-            // |----------------|-----------|------------------|
-            // |  1   1  line1  |  1   1    |  1   1   line1   |
-            // |  2      line2  |  2   2    |  2   2   line3   |
-            // |  3   2  line3  |  3   3    |  3   3   line4   |
-            // |  4   3  line4  |  4   4    |  4       line5   |
-            // |  5      line5  |  5        |                  |
-            // |----------------|-----------|------------------|
-            // |       So the second hunk's `header` is:       |
-            // |   -5,1 +3,0    | -5,1 +4,0 |    -4,1 +3,0     |
-            // |----------------|-----------|------------------|
-
-            debug!(logger, "";
-                "to apply" => hunk_to_apply.header(),
-                "to commute" => isolated_hunk.header(),
-                "preceding hunks" => format!("{}/{}", applied_hunks_offset, preceding_hunks_offset),
-            );
-
-            preceding_hunks_offset += hunk_offset;
-
-            // find the newest commit that the hunk cannot commute with
-            let mut dest_commit = None;
-            let mut commuted_old_path = old_path;
-            let mut commuted_index_hunk = isolated_hunk;
-
-            'commit: for (commit, diff) in &stack {
-                let c_logger = logger.new(o!(
-                    "commit" => commit.id().to_string(),
-                ));
-                let next_patch = match diff.by_new(commuted_old_path) {
-                    Some(patch) => patch,
-                    // this commit doesn't touch the hunk's file, so
-                    // they trivially commute, and the next commit
-                    // should be considered
-                    None => {
-                        debug!(c_logger, "skipped commit with no path");
-                        continue 'commit;
-                    }
-                };
-
-                // sometimes we just forget some change (eg: intializing some object) that
-                // happens in a completely unrelated place with the current hunks. In those
-                // cases, might be helpful to just match the first commit touching the same
-                // file as the current hunk. Use this option with care!
-                if config.whole_file {
-                    debug!(
-                        c_logger,
-                        "Commit touches the hunk file and match whole file is enabled"
-                    );
-                    dest_commit = Some(commit);
-                    break 'commit;
-                }
-
-                if next_patch.status == git2::Delta::Added {
-                    debug!(c_logger, "found noncommutative commit by add");
-                    dest_commit = Some(commit);
-                    break 'commit;
-                }
-                if commuted_old_path != next_patch.old_path.as_slice() {
-                    debug!(c_logger, "changed commute path";
-                           "path" => String::from_utf8_lossy(&next_patch.old_path).into_owned(),
-                    );
-                    commuted_old_path = next_patch.old_path.as_slice();
-                }
-                commuted_index_hunk = match commute::commute_diff_before(
-                    &commuted_index_hunk,
-                    &next_patch.hunks,
-                ) {
-                    Some(hunk) => {
-                        debug!(c_logger, "commuted hunk with commit";
-                               "offset" => (hunk.added.start as i64) - (commuted_index_hunk.added.start as i64),
-                        );
-                        hunk
-                    }
-                    // this commit contains a hunk that cannot
-                    // commute with the hunk being absorbed
-                    None => {
-                        debug!(c_logger, "found noncommutative commit by conflict");
-                        dest_commit = Some(commit);
-                        break 'commit;
-                    }
-                };
-            }
-            let dest_commit = match dest_commit {
-                Some(commit) => commit,
-                // the hunk commutes with every commit in the stack,
-                // so there is no commit to absorb it into
-                None => {
-                    modified_hunks_without_target += 1;
-                    continue 'hunk;
-                }
-            };
-
-            let hunk_with_commit = HunkWithCommit {
-                hunk_to_apply,
-                dest_commit,
-                index_patch,
-            };
-            hunks_with_commit.push(hunk_with_commit);
-
-            applied_hunks_offset += hunk_offset;
-        }
-    }
+    let HunkAttribution {
+        hunks_with_commit,
+        modified_hunks_without_target,
+        non_modified_patches,
+    } = if config.linelog {
+        linelog_mode::assign_hunks(repo, &stack, &index, logger)?
+    } else {
+        assign_hunks_by_commute(&stack, &index, &config, logger)?
+    };
 
     let target_always_sha: bool = config::fixup_target_always_sha(repo);
 
@@ -365,58 +244,18 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
         index.write()?;
     }
 
-    if non_modified_patches == index.len() {
-        announce(logger, Announcement::NoFileModifications);
-        return Ok(());
-    }
-
-    // So long as there was a patch that had the possibility of fixing up
-    // a commit, warn about the presence of patches that will commute with
-    // everything.
-    // Users that auto-stage changes may be accustomed to having untracked files
-    // in their workspace that are not absorbed, so don't warn them.
-    if non_modified_patches > 0 && !we_added_everything_to_index {
-        announce(logger, Announcement::NonFileModifications);
-    }
-
-    if modified_hunks_without_target > 0 {
-        announce(logger, Announcement::FileModificationsWithoutTarget);
-
-        match stack_end_reason {
-            stack::StackEndReason::ReachedRoot => {
-                announce(logger, Announcement::CannotFixUpPastFirstCommit);
-            }
-            stack::StackEndReason::ReachedMergeCommit => {
-                let commit = match stack.last() {
-                    Some(commit) => &commit.0,
-                    None => &head_commit,
-                };
-                announce(logger, Announcement::CannotFixUpPastMerge(commit));
-            }
-            stack::StackEndReason::ReachedAnotherAuthor => {
-                let commit = match stack.last() {
-                    Some(commit) => &commit.0,
-                    None => &head_commit,
-                };
-                announce(logger, Announcement::WillNotFixUpPastAnotherAuthor(commit));
-            }
-            stack::StackEndReason::ReachedLimit => {
-                announce(
-                    logger,
-                    Announcement::WillNotFixUpPastStackLimit(config::max_stack(repo)),
-                );
-            }
-            stack::StackEndReason::CommitsHiddenByBase => {
-                announce(
-                    logger,
-                    Announcement::CommitsHiddenByBase(config.base.unwrap()),
-                );
-            }
-            stack::StackEndReason::CommitsHiddenByBranches => {
-                announce(logger, Announcement::CommitsHiddenByBranches);
-            }
-        }
-    }
+    announce_unabsorbed(
+        logger,
+        repo,
+        &config,
+        &stack,
+        stack_end_reason,
+        &head_commit,
+        index.len(),
+        modified_hunks_without_target,
+        non_modified_patches,
+        we_added_everything_to_index,
+    );
 
     if !hunks_with_commit.is_empty() {
         use std::process::Command;
@@ -482,10 +321,257 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
     Ok(())
 }
 
-struct HunkWithCommit<'c, 'r, 'p> {
-    hunk_to_apply: owned::Hunk,
-    dest_commit: &'c git2::Commit<'r>,
-    index_patch: &'p owned::Patch,
+fn validate_config(config: &Config) -> Result<()> {
+    if config.rewrite {
+        if config.and_rebase {
+            return Err(anyhow!("--rewrite cannot be combined with --and-rebase"));
+        }
+        if !config.rebase_options.is_empty() {
+            return Err(anyhow!("--rewrite cannot be combined with rebase options"));
+        }
+        if config.whole_file {
+            return Err(anyhow!("--rewrite cannot be combined with --whole-file"));
+        }
+        if config.one_fixup_per_commit {
+            return Err(anyhow!(
+                "--rewrite cannot be combined with --one-fixup-per-commit"
+            ));
+        }
+        if config.squash {
+            return Err(anyhow!("--rewrite cannot be combined with --squash"));
+        }
+        if config.message.is_some() {
+            return Err(anyhow!("--rewrite cannot be combined with --message"));
+        }
+        return Ok(());
+    }
+
+    if !config.rebase_options.is_empty() && !config.and_rebase {
+        return Err(anyhow!(
+            "REBASE_OPTIONS were specified without --and-rebase flag"
+        ));
+    }
+    if config.linelog && config.whole_file {
+        return Err(anyhow!(
+            "--linelog cannot be combined with --whole-file because they use incompatible hunk attribution modes"
+        ));
+    }
+    Ok(())
+}
+
+fn announce_unabsorbed<'r>(
+    logger: &slog::Logger,
+    repo: &git2::Repository,
+    config: &Config,
+    stack: &[(git2::Commit<'r>, owned::Diff)],
+    stack_end_reason: stack::StackEndReason,
+    head_commit: &git2::Commit,
+    index_len: usize,
+    modified_hunks_without_target: usize,
+    non_modified_patches: usize,
+    we_added_everything_to_index: bool,
+) {
+    if non_modified_patches == index_len {
+        announce(logger, Announcement::NoFileModifications);
+        return;
+    }
+
+    // So long as there was a patch that had the possibility of fixing up
+    // a commit, warn about the presence of patches that will commute with
+    // everything.
+    // Users that auto-stage changes may be accustomed to having untracked files
+    // in their workspace that are not absorbed, so don't warn them.
+    if non_modified_patches > 0 && !we_added_everything_to_index {
+        announce(logger, Announcement::NonFileModifications);
+    }
+
+    if modified_hunks_without_target > 0 {
+        announce(logger, Announcement::FileModificationsWithoutTarget);
+
+        match stack_end_reason {
+            stack::StackEndReason::ReachedRoot => {
+                announce(logger, Announcement::CannotFixUpPastFirstCommit);
+            }
+            stack::StackEndReason::ReachedMergeCommit => {
+                let commit = match stack.last() {
+                    Some(commit) => &commit.0,
+                    None => head_commit,
+                };
+                announce(logger, Announcement::CannotFixUpPastMerge(commit));
+            }
+            stack::StackEndReason::ReachedAnotherAuthor => {
+                let commit = match stack.last() {
+                    Some(commit) => &commit.0,
+                    None => head_commit,
+                };
+                announce(logger, Announcement::WillNotFixUpPastAnotherAuthor(commit));
+            }
+            stack::StackEndReason::ReachedLimit => {
+                announce(
+                    logger,
+                    Announcement::WillNotFixUpPastStackLimit(config::max_stack(repo)),
+                );
+            }
+            stack::StackEndReason::CommitsHiddenByBase => {
+                announce(
+                    logger,
+                    Announcement::CommitsHiddenByBase(config.base.unwrap()),
+                );
+            }
+            stack::StackEndReason::CommitsHiddenByBranches => {
+                announce(logger, Announcement::CommitsHiddenByBranches);
+            }
+        }
+    }
+}
+
+pub(crate) struct HunkAttribution<'c, 'r, 'p> {
+    pub(crate) hunks_with_commit: Vec<HunkWithCommit<'c, 'r, 'p>>,
+    pub(crate) modified_hunks_without_target: usize,
+    pub(crate) non_modified_patches: usize,
+}
+
+pub(crate) struct HunkWithCommit<'c, 'r, 'p> {
+    pub(crate) hunk_to_apply: owned::Hunk,
+    pub(crate) dest_commit: &'c git2::Commit<'r>,
+    pub(crate) index_patch: &'p owned::Patch,
+}
+
+fn assign_hunks_by_commute<'c, 'r, 'p>(
+    stack: &'c [(git2::Commit<'r>, owned::Diff)],
+    index: &'p owned::Diff,
+    config: &Config,
+    logger: &slog::Logger,
+) -> Result<HunkAttribution<'c, 'r, 'p>> {
+    let mut hunks_with_commit = vec![];
+
+    let mut modified_hunks_without_target = 0usize;
+    let mut non_modified_patches = 0usize;
+    'patch: for index_patch in index.iter() {
+        let old_path = index_patch.new_path.as_slice();
+        if index_patch.status != git2::Delta::Modified {
+            debug!(logger, "skipped non-modified patch";
+                    "path" => String::from_utf8_lossy(old_path).into_owned(),
+                    "status" => format!("{:?}", index_patch.status),
+            );
+            non_modified_patches += 1;
+            continue 'patch;
+        }
+
+        let mut preceding_hunks_offset = 0isize;
+        let mut applied_hunks_offset = 0isize;
+        'hunk: for index_hunk in &index_patch.hunks {
+            debug!(logger, "next hunk";
+                   "header" => index_hunk.header(),
+                   "path" => String::from_utf8_lossy(old_path).into_owned(),
+            );
+
+            // Isolate this index hunk from preceding index hunks, then shift it
+            // again by hunks already committed into the synthetic HEAD tree.
+            let isolated_hunk = index_hunk
+                .clone()
+                .shift_added_block(-preceding_hunks_offset);
+            let hunk_to_apply = isolated_hunk
+                .clone()
+                .shift_both_blocks(applied_hunks_offset);
+            let hunk_offset = index_hunk.changed_offset();
+
+            debug!(logger, "";
+                "to apply" => hunk_to_apply.header(),
+                "to commute" => isolated_hunk.header(),
+                "preceding hunks" => format!("{}/{}", applied_hunks_offset, preceding_hunks_offset),
+            );
+
+            preceding_hunks_offset += hunk_offset;
+
+            // find the newest commit that the hunk cannot commute with
+            let mut dest_commit = None;
+            let mut commuted_old_path = old_path;
+            let mut commuted_index_hunk = isolated_hunk;
+
+            'commit: for (commit, diff) in stack {
+                let c_logger = logger.new(o!(
+                    "commit" => commit.id().to_string(),
+                ));
+                let next_patch = match diff.by_new(commuted_old_path) {
+                    Some(patch) => patch,
+                    // this commit doesn't touch the hunk's file, so
+                    // they trivially commute, and the next commit
+                    // should be considered
+                    None => {
+                        debug!(c_logger, "skipped commit with no path");
+                        continue 'commit;
+                    }
+                };
+
+                // sometimes we just forget some change (eg: intializing some object) that
+                // happens in a completely unrelated place with the current hunks. In those
+                // cases, might be helpful to just match the first commit touching the same
+                // file as the current hunk. Use this option with care!
+                if config.whole_file {
+                    debug!(
+                        c_logger,
+                        "Commit touches the hunk file and match whole file is enabled"
+                    );
+                    dest_commit = Some(commit);
+                    break 'commit;
+                }
+
+                if next_patch.status == git2::Delta::Added {
+                    debug!(c_logger, "found noncommutative commit by add");
+                    dest_commit = Some(commit);
+                    break 'commit;
+                }
+                if commuted_old_path != next_patch.old_path.as_slice() {
+                    debug!(c_logger, "changed commute path";
+                           "path" => String::from_utf8_lossy(&next_patch.old_path).into_owned(),
+                    );
+                    commuted_old_path = next_patch.old_path.as_slice();
+                }
+                commuted_index_hunk = match commute::commute_diff_before(
+                    &commuted_index_hunk,
+                    &next_patch.hunks,
+                ) {
+                    Some(hunk) => {
+                        debug!(c_logger, "commuted hunk with commit";
+                               "offset" => (hunk.added.start as i64) - (commuted_index_hunk.added.start as i64),
+                        );
+                        hunk
+                    }
+                    // this commit contains a hunk that cannot
+                    // commute with the hunk being absorbed
+                    None => {
+                        debug!(c_logger, "found noncommutative commit by conflict");
+                        dest_commit = Some(commit);
+                        break 'commit;
+                    }
+                };
+            }
+            let dest_commit = match dest_commit {
+                Some(commit) => commit,
+                // the hunk commutes with every commit in the stack,
+                // so there is no commit to absorb it into
+                None => {
+                    modified_hunks_without_target += 1;
+                    continue 'hunk;
+                }
+            };
+
+            hunks_with_commit.push(HunkWithCommit {
+                hunk_to_apply,
+                dest_commit,
+                index_patch,
+            });
+
+            applied_hunks_offset += hunk_offset;
+        }
+    }
+
+    Ok(HunkAttribution {
+        hunks_with_commit,
+        modified_hunks_without_target,
+        non_modified_patches,
+    })
 }
 
 fn apply_hunk_to_tree<'repo>(
@@ -580,6 +666,8 @@ fn index_stats(repo: &git2::Repository) -> Result<git2::DiffStats> {
 enum Announcement<'r> {
     Committed(&'r git2::Commit<'r>, &'r str, &'r git2::DiffStats),
     WouldHaveCommitted(&'r str, &'r git2::DiffStats),
+    RewroteCommit(String, String, usize),
+    WouldRewriteCommit(String),
     WouldHaveRebased(&'r std::process::Command),
     HowToSquash(String),
     NothingStagedAfterAutoStaging,
@@ -618,6 +706,18 @@ fn announce(logger: &slog::Logger, announcement: Announcement) {
             "would have committed";
             "fixup" => fixup,
             "header" => format_change_header(diff),
+        ),
+        Announcement::RewroteCommit(old, new, changed_files) => info!(
+            logger,
+            "rewrote commit";
+            "old" => old,
+            "new" => new,
+            "changed_files" => changed_files,
+        ),
+        Announcement::WouldRewriteCommit(commit) => info!(
+            logger,
+            "would rewrite commit";
+            "commit" => commit,
         ),
         Announcement::WouldHaveRebased(command) => info!(
             logger, "would have run git rebase"; "command" => format!("{:?}", command)
@@ -689,6 +789,26 @@ fn announce(logger: &slog::Logger, announcement: Announcement) {
     }
 }
 
+pub(crate) fn announce_rewrote_commit(
+    logger: &slog::Logger,
+    old: git2::Oid,
+    new: git2::Oid,
+    changed_files: usize,
+) {
+    announce(
+        logger,
+        Announcement::RewroteCommit(short_oid(old), short_oid(new), changed_files),
+    );
+}
+
+pub(crate) fn announce_would_rewrite_commit(logger: &slog::Logger, commit: git2::Oid) {
+    announce(logger, Announcement::WouldRewriteCommit(short_oid(commit)));
+}
+
+fn short_oid(oid: git2::Oid) -> String {
+    oid.to_string().chars().take(7).collect()
+}
+
 fn format_change_header(diff: &DiffStats) -> String {
     let insertions = diff.insertions();
     let deletions = diff.deletions();
@@ -726,7 +846,7 @@ fn format_change_header(diff: &DiffStats) -> String {
 mod tests {
     use git2::message_trailers_strs;
     use serde_json::json;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use tests::repo_utils::add;
 
     use super::*;
@@ -2088,6 +2208,496 @@ lines
         assert_eq!(actual_msg, expected_msg);
     }
 
+    #[test]
+    fn hg_linelog_maps_separated_edits_to_original_commits() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        stage_linelog_worktree(&ctx, &path, "a2c");
+
+        let targets = absorb_linelog_stack(&ctx, &base);
+
+        assert_eq!(targets, vec!["commit 1", "commit 3"]);
+        assert!(nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn hg_linelog_maps_middle_line_deletion_to_original_commit() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        stage_linelog_worktree(&ctx, &path, "13");
+
+        let targets = absorb_linelog_stack(&ctx, &base);
+
+        assert_eq!(targets, vec!["commit 2"]);
+        assert!(nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn hg_linelog_maps_file_boundary_insertions_to_neighboring_commits() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        stage_linelog_worktree(&ctx, &path, "a123c");
+
+        let targets = absorb_linelog_stack(&ctx, &base);
+
+        assert_eq!(targets, vec!["commit 1", "commit 3"]);
+        assert!(nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn hg_linelog_rejects_ambiguous_interior_insertion() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        stage_linelog_worktree(&ctx, &path, "1a23");
+
+        let targets = absorb_linelog_stack(&ctx, &base);
+
+        assert!(targets.is_empty());
+        assert!(!nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn hg_linelog_rejects_non_one_to_one_replacement() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        stage_linelog_worktree(&ctx, &path, "abcd");
+
+        let targets = absorb_linelog_stack(&ctx, &base);
+
+        assert!(targets.is_empty());
+        assert!(!nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn linelog_mode_can_be_enabled_by_config() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        repo_utils::set_config_flag(&ctx.repo, config::USE_LINELOG_CONFIG_NAME);
+        stage_linelog_worktree(&ctx, &path, "a2c");
+
+        let targets = absorb_stack(&ctx, &base, DEFAULT_CONFIG);
+
+        assert_eq!(targets, vec!["commit 1", "commit 3"]);
+        assert!(nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn linelog_mode_rejects_whole_file_mode() {
+        let (ctx, _path, base) = prepare_linelog_stack(&["", "1"]);
+        let config = Config {
+            base: Some(&base),
+            linelog: true,
+            whole_file: true,
+            ..DEFAULT_CONFIG
+        };
+
+        let capturing_logger = log_utils::CapturingLogger::new();
+        let err = run_with_repo(&capturing_logger.logger, &config, &ctx.repo)
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(err.contains("--linelog cannot be combined with --whole-file"));
+    }
+
+    #[test]
+    fn rewrite_absorbs_separated_edits_into_stack() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        stage_linelog_worktree(&ctx, &path, "a2c");
+
+        rewrite_linelog_stack(&ctx, &base, DEFAULT_CONFIG);
+
+        assert_eq!(
+            stack_file_contents(&ctx.repo, &base, &path),
+            vec!["a", "a2", "a2c"]
+        );
+        assert!(nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn rewrite_absorbs_middle_line_deletion_into_owner_commit() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        stage_linelog_worktree(&ctx, &path, "13");
+
+        rewrite_linelog_stack(&ctx, &base, DEFAULT_CONFIG);
+
+        assert_eq!(
+            stack_file_contents(&ctx.repo, &base, &path),
+            vec!["1", "1", "13"]
+        );
+        assert!(nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn rewrite_leaves_ambiguous_interior_insertion_staged() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        let old_head = ctx.repo.head().unwrap().target().unwrap();
+        stage_linelog_worktree(&ctx, &path, "1a23");
+
+        rewrite_linelog_stack(&ctx, &base, DEFAULT_CONFIG);
+
+        assert_eq!(ctx.repo.head().unwrap().target().unwrap(), old_head);
+        assert!(!nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn rewrite_leaves_non_one_to_one_replacement_staged() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        let old_head = ctx.repo.head().unwrap().target().unwrap();
+        stage_linelog_worktree(&ctx, &path, "abcd");
+
+        rewrite_linelog_stack(&ctx, &base, DEFAULT_CONFIG);
+
+        assert_eq!(ctx.repo.head().unwrap().target().unwrap(), old_head);
+        assert!(!nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn rewrite_leaves_non_modified_patch_staged() {
+        let (ctx, _path, base) = prepare_linelog_stack(&["", "1"]);
+        std::fs::write(ctx.join(Path::new("new-file.txt")), "new\n").unwrap();
+        repo_utils::add(&ctx.repo, Path::new("new-file.txt"));
+
+        rewrite_linelog_stack(&ctx, &base, DEFAULT_CONFIG);
+
+        assert!(!nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn rewrite_autostage_resets_index_to_rewritten_head() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        std::fs::write(ctx.join(&path), chars_as_lines("a2c")).unwrap();
+        repo_utils::set_config_flag(&ctx.repo, config::AUTO_STAGE_IF_NOTHING_STAGED_CONFIG_NAME);
+
+        rewrite_linelog_stack(&ctx, &base, DEFAULT_CONFIG);
+
+        assert_eq!(
+            stack_file_contents(&ctx.repo, &base, &path),
+            vec!["a", "a2", "a2c"]
+        );
+        assert!(nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn rewrite_dry_run_moves_no_refs_and_writes_no_pre_absorb_head() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        let old_head = ctx.repo.head().unwrap().target().unwrap();
+        stage_linelog_worktree(&ctx, &path, "a2c");
+
+        rewrite_linelog_stack(
+            &ctx,
+            &base,
+            Config {
+                dry_run: true,
+                ..DEFAULT_CONFIG
+            },
+        );
+
+        assert_eq!(ctx.repo.head().unwrap().target().unwrap(), old_head);
+        assert!(ctx.repo.find_reference("PRE_ABSORB_HEAD").is_err());
+        assert!(!nothing_left_in_index(&ctx.repo).unwrap());
+    }
+
+    #[test]
+    fn rewrite_dry_run_reports_only_commits_that_would_change() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123", "1234"]);
+        stage_linelog_worktree(&ctx, &path, "123z");
+
+        let mut capturing_logger = log_utils::CapturingLogger::new();
+        let config = Config {
+            base: Some(&base),
+            rewrite: true,
+            dry_run: true,
+            ..DEFAULT_CONFIG
+        };
+        run_with_repo(&capturing_logger.logger, &config, &ctx.repo).unwrap();
+
+        let would_rewrite_count = capturing_logger
+            .visible_logs()
+            .into_iter()
+            .filter(|log| log["msg"] == "would rewrite commit")
+            .count();
+        assert_eq!(would_rewrite_count, 1);
+    }
+
+    #[test]
+    fn rewrite_rejects_fixup_only_flags() {
+        let (ctx, _path, base) = prepare_linelog_stack(&["", "1"]);
+        let rebase_options = vec!["--keep-empty"];
+        let cases = vec![
+            (
+                Config {
+                    rewrite: true,
+                    and_rebase: true,
+                    ..DEFAULT_CONFIG
+                },
+                "--and-rebase",
+            ),
+            (
+                Config {
+                    rewrite: true,
+                    rebase_options: &rebase_options,
+                    ..DEFAULT_CONFIG
+                },
+                "rebase options",
+            ),
+            (
+                Config {
+                    rewrite: true,
+                    whole_file: true,
+                    ..DEFAULT_CONFIG
+                },
+                "--whole-file",
+            ),
+            (
+                Config {
+                    rewrite: true,
+                    one_fixup_per_commit: true,
+                    ..DEFAULT_CONFIG
+                },
+                "--one-fixup-per-commit",
+            ),
+            (
+                Config {
+                    rewrite: true,
+                    squash: true,
+                    ..DEFAULT_CONFIG
+                },
+                "--squash",
+            ),
+            (
+                Config {
+                    rewrite: true,
+                    message: Some("body"),
+                    ..DEFAULT_CONFIG
+                },
+                "--message",
+            ),
+        ];
+
+        for (config, expected) in cases {
+            let capturing_logger = log_utils::CapturingLogger::new();
+            let config = Config {
+                base: Some(&base),
+                ..config
+            };
+            let err = run_with_repo(&capturing_logger.logger, &config, &ctx.repo)
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(err.contains(expected), "{err}");
+        }
+    }
+
+    #[test]
+    fn rewrite_preserves_author_message_and_updates_parent_links() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12", "123"]);
+        let old_head = ctx.repo.head().unwrap().target().unwrap();
+        repo_utils::become_author(&ctx.repo, "rewriter", "rewriter@example.com");
+        stage_linelog_worktree(&ctx, &path, "a2c");
+
+        rewrite_linelog_stack(
+            &ctx,
+            &base,
+            Config {
+                force_author: true,
+                ..DEFAULT_CONFIG
+            },
+        );
+
+        let commits = stack_commits_oldest_to_newest(&ctx.repo, &base);
+        assert_eq!(commits.len(), 3);
+        for (idx, commit) in commits.iter().enumerate() {
+            assert_eq!(commit.message().unwrap(), format!("commit {}", idx + 1));
+            assert_eq!(commit.author().name(), Some("nobody"));
+            assert_eq!(commit.committer().name(), Some("rewriter"));
+            if idx > 0 {
+                assert_eq!(commit.parent(0).unwrap().id(), commits[idx - 1].id());
+            }
+        }
+        assert_eq!(
+            ctx.repo
+                .find_reference("PRE_ABSORB_HEAD")
+                .unwrap()
+                .target()
+                .unwrap(),
+            old_head
+        );
+    }
+
+    #[test]
+    fn rewrite_preserves_non_utf8_commit_message_bytes() {
+        let (ctx, path, base) = prepare_linelog_stack(&[""]);
+        let message = b"bad-\xff-message\n";
+
+        std::fs::write(ctx.join(&path), chars_as_lines("1")).unwrap();
+        let tree = repo_utils::add(&ctx.repo, &path);
+        let parent = ctx
+            .repo
+            .find_commit(git2::Oid::from_str(&base).unwrap())
+            .unwrap();
+        let commit = raw_commit(
+            &ctx.repo,
+            tree.id(),
+            &[parent.id()],
+            b"author nobody <nobody@example.com> 0 +0000\n",
+            b"committer nobody <nobody@example.com> 0 +0000\n",
+            message,
+        );
+        ctx.repo
+            .reference("refs/heads/master", commit, true, "")
+            .unwrap();
+
+        stage_linelog_worktree(&ctx, &path, "a");
+        rewrite_linelog_stack(&ctx, &base, DEFAULT_CONFIG);
+
+        let new_head = ctx.repo.head().unwrap().peel_to_commit().unwrap();
+        assert_eq!(new_head.message_raw_bytes(), message);
+    }
+
+    // These cases are ported from Mercurial's
+    // tests/test-absorb-filefixupstate.py in changeset 5111d11b8719. The
+    // character strings model file contents, with each character expanded to
+    // one line so the tests can describe line ownership compactly.
+    fn prepare_linelog_stack(contents: &[&str]) -> (repo_utils::Context, PathBuf, String) {
+        assert!(!contents.is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init_opts(
+            dir.path(),
+            git2::RepositoryInitOptions::new().initial_head("master"),
+        )
+        .unwrap();
+        repo_utils::become_author(&repo, "nobody", "nobody@example.com");
+
+        let path = PathBuf::from("linelog.txt");
+        std::fs::write(dir.path().join(&path), chars_as_lines(contents[0])).unwrap();
+
+        let base_commit = {
+            let tree = repo_utils::add(&repo, &path);
+            repo_utils::commit(&repo, "HEAD", "base", &tree, &[])
+        };
+        let base = base_commit.id().to_string();
+
+        {
+            let mut parent = base_commit;
+            for (idx, content) in contents.iter().enumerate().skip(1) {
+                std::fs::write(dir.path().join(&path), chars_as_lines(content)).unwrap();
+                let tree = repo_utils::add(&repo, &path);
+                parent =
+                    repo_utils::commit(&repo, "HEAD", &format!("commit {idx}"), &tree, &[&parent]);
+            }
+        }
+
+        (repo_utils::Context { repo, dir }, path, base)
+    }
+
+    fn stage_linelog_worktree(ctx: &repo_utils::Context, path: &Path, content: &str) {
+        std::fs::write(ctx.join(path), chars_as_lines(content)).unwrap();
+        repo_utils::add(&ctx.repo, path);
+    }
+
+    fn absorb_linelog_stack(ctx: &repo_utils::Context, base: &str) -> Vec<String> {
+        absorb_stack(
+            ctx,
+            base,
+            Config {
+                linelog: true,
+                ..DEFAULT_CONFIG
+            },
+        )
+    }
+
+    fn rewrite_linelog_stack<'a>(ctx: &repo_utils::Context, base: &'a str, config: Config<'a>) {
+        let capturing_logger = log_utils::CapturingLogger::new();
+        let config = Config {
+            base: Some(base),
+            rewrite: true,
+            ..config
+        };
+        run_with_repo(&capturing_logger.logger, &config, &ctx.repo).unwrap();
+    }
+
+    fn stack_file_contents(repo: &git2::Repository, base: &str, path: &Path) -> Vec<String> {
+        stack_commits_oldest_to_newest(repo, base)
+            .into_iter()
+            .map(|commit| commit_file_as_chars(repo, &commit, path))
+            .collect()
+    }
+
+    fn stack_commits_oldest_to_newest<'repo>(
+        repo: &'repo git2::Repository,
+        base: &str,
+    ) -> Vec<git2::Commit<'repo>> {
+        let base = git2::Oid::from_str(base).unwrap();
+        let mut revwalk = repo.revwalk().unwrap();
+        revwalk.push_head().unwrap();
+
+        let mut oids = Vec::new();
+        for oid in revwalk {
+            let oid = oid.unwrap();
+            if oid == base {
+                break;
+            }
+            oids.push(oid);
+        }
+        oids.reverse();
+        oids.into_iter()
+            .map(|oid| repo.find_commit(oid).unwrap())
+            .collect()
+    }
+
+    fn commit_file_as_chars(repo: &git2::Repository, commit: &git2::Commit, path: &Path) -> String {
+        let tree = commit.tree().unwrap();
+        let entry = tree.get_path(path).unwrap();
+        let blob = entry.to_object(repo).unwrap().peel_to_blob().unwrap();
+        std::str::from_utf8(blob.content())
+            .unwrap()
+            .lines()
+            .collect()
+    }
+
+    fn raw_commit(
+        repo: &git2::Repository,
+        tree: git2::Oid,
+        parents: &[git2::Oid],
+        author: &[u8],
+        committer: &[u8],
+        message: &[u8],
+    ) -> git2::Oid {
+        let mut content = Vec::new();
+        content.extend_from_slice(format!("tree {tree}\n").as_bytes());
+        for parent in parents {
+            content.extend_from_slice(format!("parent {parent}\n").as_bytes());
+        }
+        content.extend_from_slice(author);
+        content.extend_from_slice(committer);
+        content.push(b'\n');
+        content.extend_from_slice(message);
+        repo.odb()
+            .unwrap()
+            .write(git2::ObjectType::Commit, &content)
+            .unwrap()
+    }
+
+    fn absorb_stack<'a>(
+        ctx: &repo_utils::Context,
+        base: &'a str,
+        config: Config<'a>,
+    ) -> Vec<String> {
+        let mut capturing_logger = log_utils::CapturingLogger::new();
+        let config = Config {
+            base: Some(base),
+            ..config
+        };
+        run_with_repo(&capturing_logger.logger, &config, &ctx.repo).unwrap();
+
+        capturing_logger
+            .visible_logs()
+            .into_iter()
+            .filter(|log| log["msg"] == "committed")
+            .map(|log| log["fixup"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn chars_as_lines(content: &str) -> String {
+        content.chars().flat_map(|ch| [ch, '\n']).collect()
+    }
+
     /// Perform a revwalk from HEAD, extracting the commit messages.
     fn extract_commit_messages(repo: &git2::Repository) -> Vec<String> {
         let mut revwalk = repo.revwalk().unwrap();
@@ -2114,6 +2724,8 @@ lines
         and_rebase: false,
         rebase_options: &Vec::new(),
         whole_file: false,
+        linelog: false,
+        rewrite: false,
         one_fixup_per_commit: false,
         squash: false,
         message: None,
