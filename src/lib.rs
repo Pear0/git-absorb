@@ -40,6 +40,12 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
     let config = config::unify(config, repo);
     validate_config(&config)?;
 
+    let rewrite_head = if config.rewrite {
+        Some(rewrite::HeadState::capture(repo)?)
+    } else {
+        None
+    };
+    let mut staged_index = None;
     let mut we_added_everything_to_index = false;
     if nothing_left_in_index(repo)? {
         if config::auto_stage_if_nothing_staged(repo) {
@@ -48,13 +54,21 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
             let pathspec = ["."];
             let mut index = repo.index()?;
             index.add_all(pathspec.iter(), git2::IndexAddOption::DEFAULT, None)?;
-            index.write()?;
+            if !config.dry_run {
+                index.write()?;
+            }
 
-            if nothing_left_in_index(repo)? {
+            if repo
+                .diff_tree_to_index(Some(&repo.head()?.peel_to_tree()?), Some(&index), None)?
+                .deltas()
+                .len()
+                == 0
+            {
                 announce(logger, Announcement::NothingStagedAfterAutoStaging);
                 return Ok(());
             }
 
+            staged_index = Some(index);
             we_added_everything_to_index = true;
         } else {
             announce(logger, Announcement::NothingStaged);
@@ -109,7 +123,7 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
     let mut head_tree = repo.head()?.peel_to_tree()?;
     let index = owned::Diff::new(&repo.diff_tree_to_index(
         Some(&head_tree),
-        None,
+        staged_index.as_ref(),
         diff_options.as_mut(),
     )?)?;
     trace!(logger, "parsed index";
@@ -120,6 +134,7 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
         let head_commit = repo.head()?.peel_to_commit()?;
         let outcome = rewrite::run(
             repo,
+            rewrite_head.as_ref().unwrap(),
             &stack,
             &index,
             &config,
@@ -235,7 +250,7 @@ fn run_with_repo(logger: &slog::Logger, config: &Config, repo: &git2::Repository
         }
     }
 
-    if we_added_everything_to_index {
+    if we_added_everything_to_index && !config.dry_run {
         // now that the fixup commits have been created,
         // we should unstage the remaining changes from the index.
 
@@ -667,7 +682,6 @@ enum Announcement<'r> {
     Committed(&'r git2::Commit<'r>, &'r str, &'r git2::DiffStats),
     WouldHaveCommitted(&'r str, &'r git2::DiffStats),
     RewroteCommit(String, String, usize),
-    WouldRewriteCommit(String),
     WouldHaveRebased(&'r std::process::Command),
     HowToSquash(String),
     NothingStagedAfterAutoStaging,
@@ -713,11 +727,6 @@ fn announce(logger: &slog::Logger, announcement: Announcement) {
             "old" => old,
             "new" => new,
             "changed_files" => changed_files,
-        ),
-        Announcement::WouldRewriteCommit(commit) => info!(
-            logger,
-            "would rewrite commit";
-            "commit" => commit,
         ),
         Announcement::WouldHaveRebased(command) => info!(
             logger, "would have run git rebase"; "command" => format!("{:?}", command)
@@ -799,10 +808,6 @@ pub(crate) fn announce_rewrote_commit(
         logger,
         Announcement::RewroteCommit(short_oid(old), short_oid(new), changed_files),
     );
-}
-
-pub(crate) fn announce_would_rewrite_commit(logger: &slog::Logger, commit: git2::Oid) {
-    announce(logger, Announcement::WouldRewriteCommit(short_oid(commit)));
 }
 
 fn short_oid(oid: git2::Oid) -> String {
@@ -2406,12 +2411,148 @@ lines
         };
         run_with_repo(&capturing_logger.logger, &config, &ctx.repo).unwrap();
 
-        let would_rewrite_count = capturing_logger
-            .visible_logs()
-            .into_iter()
-            .filter(|log| log["msg"] == "would rewrite commit")
-            .count();
-        assert_eq!(would_rewrite_count, 1);
+        let logs = capturing_logger.visible_logs();
+        assert_eq!(logs.len(), 1);
+        let comparison = logs[0]["msg"].as_str().unwrap();
+        assert!(comparison.starts_with("Stack range-diff (before -> after):"));
+        assert!(comparison.contains("commit 4"));
+        for unchanged in ["commit 1", "commit 2", "commit 3"] {
+            assert!(!comparison.contains(unchanged));
+        }
+    }
+
+    #[test]
+    fn rewrite_dry_run_shows_before_and_after_patches_including_root() {
+        for include_root in [false, true] {
+            let contents = if include_root {
+                vec!["1", "12", "123"]
+            } else {
+                vec!["", "1", "12", "123"]
+            };
+            let (ctx, path, base) = prepare_linelog_stack(&contents);
+            stage_linelog_worktree(&ctx, &path, "a2c");
+            let head = ctx.repo.head().unwrap().target();
+            let index = std::fs::read(ctx.repo.path().join("index")).unwrap();
+            let worktree = std::fs::read(ctx.join(&path)).unwrap();
+            let mut logger = log_utils::CapturingLogger::new();
+            let config = Config {
+                base: if include_root { None } else { Some(&base) },
+                rewrite: true,
+                dry_run: true,
+                ..DEFAULT_CONFIG
+            };
+            run_with_repo(&logger.logger, &config, &ctx.repo).unwrap();
+            let logs = logger.logs();
+            let comparison = logs
+                .iter()
+                .filter_map(|log| log["msg"].as_str())
+                .find(|msg| msg.starts_with("Stack range-diff (before -> after):"))
+                .unwrap();
+            assert!(comparison.contains("linelog.txt"), "{comparison}");
+            for change in ["-+1", "++a", "-+3", "++c"] {
+                assert!(
+                    comparison.contains(change),
+                    "missing {change}: {comparison}"
+                );
+            }
+            if include_root {
+                assert!(comparison.contains("base"), "{comparison}");
+            }
+            assert_eq!(ctx.repo.head().unwrap().target(), head);
+            assert_eq!(std::fs::read(ctx.repo.path().join("index")).unwrap(), index);
+            assert_eq!(std::fs::read(ctx.join(&path)).unwrap(), worktree);
+            assert!(ctx.repo.find_reference("PRE_ABSORB_HEAD").is_err());
+            // A real rewrite must produce the content previewed above.
+            run_with_repo(
+                &logger.logger,
+                &Config {
+                    dry_run: false,
+                    ..config
+                },
+                &ctx.repo,
+            )
+            .unwrap();
+            let head = ctx.repo.head().unwrap().peel_to_commit().unwrap();
+            assert_eq!(commit_file_as_chars(&ctx.repo, &head, &path), "a2c");
+        }
+    }
+
+    #[test]
+    fn rewrite_preserves_unstaged_changes_and_previews_only_staged_edits() {
+        for auto_stage in [false, true] {
+            let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12"]);
+            if auto_stage {
+                repo_utils::set_config_flag(
+                    &ctx.repo,
+                    config::AUTO_STAGE_IF_NOTHING_STAGED_CONFIG_NAME,
+                );
+            }
+            stage_linelog_worktree(&ctx, &path, "a2");
+            // Further unstaged edits to the same line and another line must survive.
+            std::fs::write(ctx.join(&path), chars_as_lines("bc")).unwrap();
+            let index = std::fs::read(ctx.repo.path().join("index")).unwrap();
+            let mut logger = log_utils::CapturingLogger::new();
+            let config = Config {
+                base: Some(&base),
+                rewrite: true,
+                dry_run: true,
+                ..DEFAULT_CONFIG
+            };
+            run_with_repo(&logger.logger, &config, &ctx.repo).unwrap();
+            let logs = logger.logs();
+            let comparison = logs
+                .iter()
+                .filter_map(|log| log["msg"].as_str())
+                .find(|msg| msg.starts_with("Stack range-diff"))
+                .unwrap();
+            assert!(comparison.contains("++a"));
+            assert!(!comparison.contains("++b"));
+            assert!(!comparison.contains("++c"));
+            assert_eq!(std::fs::read(ctx.repo.path().join("index")).unwrap(), index);
+            assert_eq!(
+                std::fs::read(ctx.join(&path)).unwrap(),
+                chars_as_lines("bc").as_bytes()
+            );
+
+            run_with_repo(
+                &logger.logger,
+                &Config {
+                    dry_run: false,
+                    ..config
+                },
+                &ctx.repo,
+            )
+            .unwrap();
+            let head = ctx.repo.head().unwrap().peel_to_commit().unwrap();
+            assert_eq!(commit_file_as_chars(&ctx.repo, &head, &path), "a2");
+            assert!(nothing_left_in_index(&ctx.repo).unwrap());
+            assert_eq!(
+                std::fs::read(ctx.join(&path)).unwrap(),
+                chars_as_lines("bc").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_dry_run_omits_range_diff_when_nothing_is_accepted() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12"]);
+        stage_linelog_worktree(&ctx, &path, "1x2");
+        let mut logger = log_utils::CapturingLogger::new();
+        run_with_repo(
+            &logger.logger,
+            &Config {
+                base: Some(&base),
+                rewrite: true,
+                dry_run: true,
+                ..DEFAULT_CONFIG
+            },
+            &ctx.repo,
+        )
+        .unwrap();
+        assert!(!logger
+            .logs()
+            .iter()
+            .any(|log| log["msg"].as_str().unwrap().starts_with("Stack range-diff")));
     }
 
     #[test]
@@ -2547,6 +2688,155 @@ lines
 
         let new_head = ctx.repo.head().unwrap().peel_to_commit().unwrap();
         assert_eq!(new_head.message_raw_bytes(), message);
+    }
+
+    #[test]
+    fn linelog_rejects_incomplete_text_history() {
+        let (ctx, path, base) = prepare_linelog_stack(&["ab", "cd"]);
+        let commit = ctx.repo.head().unwrap().peel_to_commit().unwrap();
+        let parent = ctx
+            .repo
+            .find_commit(git2::Oid::from_str(&base).unwrap())
+            .unwrap();
+        // A binary attribute can suppress hunks even when neither blob has NULs.
+        let diff = owned::Diff::new(
+            &ctx.repo
+                .diff_tree_to_tree(
+                    Some(&parent.tree().unwrap()),
+                    Some(&commit.tree().unwrap()),
+                    Some(git2::DiffOptions::new().force_binary(true)),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(diff[0].hunks.is_empty());
+        let stack = vec![(commit, diff)];
+        assert!(linelog_mode::FileLineLog::build(
+            &ctx.repo,
+            &stack,
+            path.to_str().unwrap().as_bytes()
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn linelog_rejects_binary_transitions_without_changing_history() {
+        for rewrite in [false, true] {
+            for contents in [vec!["", "ab", "\0", "cd"], vec!["\0", "abcd", "aBcd"]] {
+                let (ctx, path, base) = prepare_linelog_stack(&contents);
+                let head = ctx.repo.head().unwrap().target().unwrap();
+                stage_linelog_worktree(&ctx, &path, "CD");
+                let index = std::fs::read(ctx.repo.path().join("index")).unwrap();
+                let mut logger = log_utils::CapturingLogger::new();
+                run_with_repo(
+                    &logger.logger,
+                    &Config {
+                        base: Some(&base),
+                        linelog: true,
+                        rewrite,
+                        ..DEFAULT_CONFIG
+                    },
+                    &ctx.repo,
+                )
+                .unwrap();
+                assert_eq!(ctx.repo.head().unwrap().target(), Some(head));
+                assert_eq!(std::fs::read(ctx.repo.path().join("index")).unwrap(), index);
+                assert!(logger.logs().iter().any(|log| log["msg"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Some file modifications")));
+            }
+        }
+    }
+
+    #[test]
+    fn dry_run_autostage_preserves_index_for_accepted_and_rejected_edits() {
+        for rewrite in [false, true] {
+            for content in ["A2", "1x2"] {
+                let (ctx, path, base) = prepare_linelog_stack(&["", "1", "12"]);
+                repo_utils::set_config_flag(
+                    &ctx.repo,
+                    config::AUTO_STAGE_IF_NOTHING_STAGED_CONFIG_NAME,
+                );
+                std::fs::write(ctx.join(&path), chars_as_lines(content)).unwrap();
+                let index = std::fs::read(ctx.repo.path().join("index")).unwrap();
+                let head = ctx.repo.head().unwrap().target();
+                let mut logger = log_utils::CapturingLogger::new();
+                run_with_repo(
+                    &logger.logger,
+                    &Config {
+                        base: Some(&base),
+                        linelog: true,
+                        rewrite,
+                        dry_run: true,
+                        ..DEFAULT_CONFIG
+                    },
+                    &ctx.repo,
+                )
+                .unwrap();
+                assert_eq!(std::fs::read(ctx.repo.path().join("index")).unwrap(), index);
+                assert_eq!(ctx.repo.head().unwrap().target(), head);
+                assert!(ctx.repo.find_reference("PRE_ABSORB_HEAD").is_err());
+                assert_eq!(
+                    std::fs::read(ctx.join(&path)).unwrap(),
+                    chars_as_lines(content).as_bytes()
+                );
+                let logs = logger.logs();
+                assert!(logs.iter().any(|log| log["msg"].as_str().unwrap().contains(
+                    if content == "1x2" {
+                        "Some file modifications"
+                    } else if rewrite {
+                        "Stack range-diff"
+                    } else {
+                        "would have committed"
+                    }
+                )));
+            }
+        }
+    }
+
+    #[test]
+    fn linelog_warns_when_only_part_of_a_hunk_is_absorbed() {
+        for rewrite in [false, true] {
+            for content in ["ABz", "z"] {
+                let (ctx, path, base) = prepare_linelog_stack(&["axz", "abz"]);
+                stage_linelog_worktree(&ctx, &path, content);
+                let mut logger = log_utils::CapturingLogger::new();
+                run_with_repo(
+                    &logger.logger,
+                    &Config {
+                        base: Some(&base),
+                        linelog: true,
+                        rewrite,
+                        ..DEFAULT_CONFIG
+                    },
+                    &ctx.repo,
+                )
+                .unwrap();
+                let head = ctx.repo.head().unwrap().peel_to_commit().unwrap();
+                assert_eq!(
+                    commit_file_as_chars(&ctx.repo, &head, &path),
+                    if content == "z" { "az" } else { "aBz" }
+                );
+                assert!(!nothing_left_in_index(&ctx.repo).unwrap());
+                assert!(logger.logs().iter().any(|log| log["msg"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("Some file modifications")));
+            }
+        }
+    }
+
+    #[test]
+    fn rewrite_preserves_deleted_lines_between_surviving_lines() {
+        let (ctx, path, base) = prepare_linelog_stack(&["", "ab", "axb", "ab"]);
+        stage_linelog_worktree(&ctx, &path, "AB");
+        rewrite_linelog_stack(&ctx, &base, DEFAULT_CONFIG);
+        assert_eq!(
+            stack_file_contents(&ctx.repo, &base, &path),
+            vec!["AB", "AxB", "AB"]
+        );
     }
 
     // These cases are ported from Mercurial's

@@ -49,7 +49,12 @@ FLAGS
 
 -n::
 --dry-run::
-        Don't make any actual changes
+        Preview changes without updating refs, the index, or working files.
+        With `--rewrite`, also show a `git range-diff` of the original and
+        proposed commit stacks. The left side is before absorption and the right
+        side is after. Patch changes appear below each matched commit.
+        Preview commits and trees are written as unreferenced Git objects;
+        no branch or backup ref is created or moved.
 
 --no-limit::
         Remove absorb stack limit. Has no effect when used with `--base`

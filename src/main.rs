@@ -16,7 +16,7 @@ struct Cli {
     /// Use this commit as the base of the absorb stack
     #[clap(long, short)]
     base: Option<String>,
-    /// Don't make any actual changes
+    /// Preview changes without updating refs or the index; --rewrite shows a stack range-diff
     #[clap(long, short = 'n')]
     dry_run: bool,
     /// Remove absorb stack limit. Be careful with this

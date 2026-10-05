@@ -85,6 +85,17 @@ Note: `cargo install` does not currently know how to install manpages ([cargo#27
 3. If you are satisfied with the output, `git rebase -i --autosquash` to squash the `fixup!` commits into their predecessors. You can set the [`GIT_SEQUENCE_EDITOR`](https://stackoverflow.com/a/29094904) environment variable if you don't need to edit the rebase TODO file.
 4. If you are not satisfied (or if something bad happened), `git reset --soft PRE_ABSORB_HEAD` will reset to the pre-absorption commit and recover your old state. (You can also find the commit in question with `git reflog`.) And if you think `git absorb` is at fault, please [file an issue](https://github.com/tummychow/git-absorb/issues/new).
 
+To preview experimental direct stack rewriting, run:
+
+```sh
+git absorb --rewrite --dry-run
+```
+
+The preview includes a `git range-diff`: original commits on the left, proposed
+commits on the right, and changes to their patches underneath. Only the rewritten
+suffix of the stack is compared. Refs, staging, and working files stay unchanged;
+the preview creates unreferenced Git objects that Git can later garbage-collect.
+
 ## How it works (roughly)
 
 `git absorb` works by checking if two patches P1 and P2 *commute*, that is, if applying P1 before P2 gives the same result as applying P2 before P1.

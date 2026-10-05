@@ -43,9 +43,12 @@ pub(crate) fn assign_hunks<'c, 'r, 'p>(
                 .shift_added_block(-preceding_hunks_offset);
             preceding_hunks_offset += index_hunk.changed_offset();
 
-            let fixups = history.analyze_hunk(&isolated_hunk);
-            if fixups.is_empty() {
+            let analysis = history.analyze_hunk(&isolated_hunk);
+            if analysis.has_unabsorbed {
                 modified_hunks_without_target += 1;
+            }
+            let fixups = analysis.fixups;
+            if fixups.is_empty() {
                 continue;
             }
 
@@ -124,9 +127,12 @@ pub(crate) fn plan_rewrite<'c, 'r>(
                 .shift_added_block(-preceding_hunks_offset);
             preceding_hunks_offset += index_hunk.changed_offset();
 
-            let fixups = history.analyze_hunk(&isolated_hunk);
-            if fixups.is_empty() {
+            let analysis = history.analyze_hunk(&isolated_hunk);
+            if analysis.has_unabsorbed {
                 modified_hunks_without_target += 1;
+            }
+            let fixups = analysis.fixups;
+            if fixups.is_empty() {
                 continue;
             }
 
@@ -155,9 +161,23 @@ pub(crate) fn plan_rewrite<'c, 'r>(
 
 pub(crate) struct FileLineLog<'c, 'r> {
     log: AbstractLineLog<Vec<u8>>,
+    // Immutable attribution data, computed once before rewrite edits.
+    annotated: Vec<AnnotatedLine>,
+    historical_positions: HashMap<usize, usize>,
     rev_to_commit: HashMap<usize, &'c git2::Commit<'r>>,
     rev_to_rewrite_rev: HashMap<usize, usize>,
     commit_to_rewrite_rev: HashMap<git2::Oid, usize>,
+}
+
+#[derive(Clone)]
+struct AnnotatedLine {
+    rev: usize,
+    pc: usize,
+}
+
+struct HunkAnalysis {
+    fixups: Vec<LineFixup>,
+    has_unabsorbed: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -185,6 +205,10 @@ impl<'c, 'r> FileLineLog<'c, 'r> {
             let base_tree = oldest_commit.parent(0)?.tree()?;
             blob_content(repo, &base_tree, path)?.unwrap_or_default()
         };
+
+        if base_content.contains(&0) {
+            return Ok(None);
+        }
 
         let mut log = AbstractLineLog::<Vec<u8>>::default().edit_chunk(
             0,
@@ -222,31 +246,80 @@ impl<'c, 'r> FileLineLog<'c, 'r> {
                 return Ok(None);
             }
 
+            let content = blob_content(repo, &commit.tree()?, path)?.unwrap_or_default();
+            if content.contains(&0) {
+                return Ok(None);
+            }
             for hunk in patch.hunks.iter().rev() {
                 let (a1, a2) = old_range(hunk)?;
+                let current = log.checkout_lines(log.max_rev());
+                // LineLog includes an END sentinel. Never allow edits to consume it.
+                if a2 >= current.len()
+                    || !current
+                        .iter()
+                        .skip(a1)
+                        .take(a2 - a1)
+                        .zip(hunk.removed.lines.iter())
+                        .all(|(line, removed)| line.data.as_ref() == removed)
+                {
+                    return Ok(None);
+                }
                 let b_lines = hunk.added.lines.iter().cloned().collect();
                 let a_rev = log.max_rev();
                 log = log.edit_chunk(a_rev, a1, a2, original_rev, b_lines);
             }
+            // Binary/attribute-driven deltas may contain no text hunks. Do not
+            // trust a reconstruction that differs from the original Git blob.
+            if join_lines(
+                log.checkout_lines(log.max_rev())
+                    .iter()
+                    .map(|line| &*line.data),
+            ) != content
+            {
+                return Ok(None);
+            }
         }
 
+        let annotated = log
+            .checkout_lines(log.max_rev())
+            .iter()
+            .map(|line| AnnotatedLine {
+                rev: line.rev,
+                pc: line.pc,
+            })
+            .collect();
+        let historical_positions = log
+            .checkout_range_lines(0, log.max_rev())
+            .iter()
+            .filter(|line| line.rev != 0)
+            .enumerate()
+            .map(|(position, line)| (line.pc, position))
+            .collect();
         Ok(Some(Self {
             log,
+            annotated,
+            historical_positions,
             rev_to_commit,
             rev_to_rewrite_rev,
             commit_to_rewrite_rev,
         }))
     }
 
-    pub(crate) fn analyze_hunk(&self, hunk: &owned::Hunk) -> Vec<LineFixup> {
+    fn analyze_hunk(&self, hunk: &owned::Hunk) -> HunkAnalysis {
         let Ok((a1, a2)) = old_range(hunk) else {
-            return Vec::new();
+            return HunkAnalysis {
+                fixups: Vec::new(),
+                has_unabsorbed: true,
+            };
         };
         let b1 = 0;
         let b2 = hunk.added.lines.len();
-        let annotated = self.log.checkout_lines(self.log.max_rev());
-        if a2 > annotated.len() {
-            return Vec::new();
+        let annotated = &self.annotated;
+        if a2 >= annotated.len() {
+            return HunkAnalysis {
+                fixups: Vec::new(),
+                has_unabsorbed: true,
+            };
         }
 
         let mut involved: Vec<_> = annotated.iter().skip(a1).take(a2 - a1).cloned().collect();
@@ -285,7 +358,10 @@ impl<'c, 'r> FileLineLog<'c, 'r> {
         } else if a2 - a1 == b2 - b1 || b1 == b2 {
             for i in a1..a2 {
                 let Some(line) = annotated.get(i) else {
-                    return Vec::new();
+                    return HunkAnalysis {
+                        fixups: Vec::new(),
+                        has_unabsorbed: true,
+                    };
                 };
                 if line.rev <= 1 {
                     continue;
@@ -306,38 +382,36 @@ impl<'c, 'r> FileLineLog<'c, 'r> {
             }
         }
 
-        self.optimize_fixups(fixups)
+        let removed: usize = fixups.iter().map(|fixup| fixup.a2 - fixup.a1).sum();
+        let added: usize = fixups.iter().map(|fixup| fixup.b2 - fixup.b1).sum();
+        HunkAnalysis {
+            has_unabsorbed: removed != a2 - a1 || added != b2 - b1,
+            fixups: self.optimize_fixups(fixups),
+        }
     }
 
     fn is_continuous_by_pc(&self, start_pc: usize, end_pc: usize, a1: usize, a2: usize) -> bool {
         if a1 >= a2 {
             return true;
         }
-        let all_lines = self.log.checkout_range_lines(0, self.log.max_rev());
-        let Some(start_pos) = all_lines.iter().position(|line| line.pc == start_pc) else {
-            return false;
-        };
-        let Some(end_pos) = all_lines.iter().position(|line| line.pc == end_pc) else {
-            return false;
-        };
-        if start_pos > end_pos {
-            return false;
+        match (
+            self.historical_positions.get(&start_pc),
+            self.historical_positions.get(&end_pc),
+        ) {
+            (Some(start), Some(end)) => end.checked_sub(*start) == Some(a2 - a1),
+            _ => false,
         }
-
-        all_lines
-            .iter()
-            .skip(start_pos)
-            .take(end_pos - start_pos + 1)
-            .filter(|line| line.rev != 0)
-            .count()
-            == a2 - a1 + 1
     }
 
     fn optimize_fixups(&self, fixups: Vec<LineFixup>) -> Vec<LineFixup> {
         let mut result: Vec<LineFixup> = Vec::new();
         for fixup in fixups {
             if let Some(last) = result.last_mut() {
-                let annotated = self.log.checkout_lines(self.log.max_rev());
+                if fixup.rev != last.rev || fixup.a1 != last.a2 || fixup.b1 != last.b2 {
+                    result.push(fixup);
+                    continue;
+                }
+                let annotated = &self.annotated;
                 let continuous = match (
                     annotated.get(fixup.a1.saturating_sub(1)),
                     annotated.get(fixup.a1),
@@ -499,5 +573,107 @@ pub(crate) fn split_path(path: &[u8]) -> Option<(&[u8], &[u8])> {
     match path.iter().position(|byte| *byte == b'/') {
         Some(idx) => Some((&path[..idx], &path[idx + 1..])),
         None => Some((path, &[])),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn history(log: AbstractLineLog<Vec<u8>>) -> FileLineLog<'static, 'static> {
+        let annotated = log
+            .checkout_lines(log.max_rev())
+            .iter()
+            .map(|line| AnnotatedLine {
+                rev: line.rev,
+                pc: line.pc,
+            })
+            .collect();
+        let historical_positions = log
+            .checkout_range_lines(0, log.max_rev())
+            .iter()
+            .filter(|line| line.rev != 0)
+            .enumerate()
+            .map(|(position, line)| (line.pc, position))
+            .collect();
+        FileLineLog {
+            log,
+            annotated,
+            historical_positions,
+            rev_to_commit: HashMap::new(),
+            rev_to_rewrite_rev: HashMap::new(),
+            commit_to_rewrite_rev: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn cached_continuity_matches_history_with_deleted_lines() {
+        let log = AbstractLineLog::default()
+            .edit_chunk(0, 0, 0, 3, split_lines(b"a\nb\nc\nd\n"))
+            .edit_chunk(3, 1, 2, 5, split_lines(b"x\ny\n"))
+            .edit_chunk(5, 2, 4, 7, Vec::new());
+        let history = history(log);
+        let all = history.log.checkout_range_lines(0, history.log.max_rev());
+        for a1 in 0..history.annotated.len() {
+            for a2 in a1..history.annotated.len() {
+                let start_pc = history.annotated[a1].pc;
+                let end_pc = history.annotated[a2].pc;
+                let start = all.iter().position(|line| line.pc == start_pc).unwrap();
+                let end = all.iter().position(|line| line.pc == end_pc).unwrap();
+                let expected = a1 >= a2
+                    || (start <= end
+                        && all
+                            .iter()
+                            .skip(start)
+                            .take(end - start + 1)
+                            .filter(|line| line.rev != 0)
+                            .count()
+                            == a2 - a1 + 1);
+                assert_eq!(
+                    history.is_continuous_by_pc(start_pc, end_pc, a1, a2),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn large_mixed_owner_hunk_coalesces_into_two_fixups() {
+        let n = 10_000;
+        let log = AbstractLineLog::default()
+            .edit_chunk(0, 0, 0, 3, vec![b"a\n".to_vec(); n / 2])
+            .edit_chunk(3, n / 2, n / 2, 5, vec![b"a\n".to_vec(); n / 2]);
+        let history = history(log);
+        let hunk = owned::Hunk {
+            removed: owned::Block {
+                start: 1,
+                lines: std::rc::Rc::new(vec![b"a\n".to_vec(); n]),
+            },
+            added: owned::Block {
+                start: 1,
+                lines: std::rc::Rc::new(vec![b"b\n".to_vec(); n]),
+            },
+        };
+        let start = std::time::Instant::now();
+        let analysis = history.analyze_hunk(&hunk);
+        eprintln!("attributed {n} lines in {:?}", start.elapsed());
+        assert!(!analysis.has_unabsorbed);
+        assert_eq!(analysis.fixups.len(), 2);
+        assert_eq!(
+            (
+                analysis.fixups[0].rev,
+                analysis.fixups[0].a1,
+                analysis.fixups[0].a2
+            ),
+            (3, 0, n / 2)
+        );
+        assert_eq!(
+            (
+                analysis.fixups[1].rev,
+                analysis.fixups[1].a1,
+                analysis.fixups[1].a2
+            ),
+            (5, n / 2, n)
+        );
     }
 }
